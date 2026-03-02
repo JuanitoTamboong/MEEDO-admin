@@ -11,6 +11,8 @@ try {
     $db->exec("DROP TABLE IF EXISTS repairs");
     $db->exec("DROP TABLE IF EXISTS payments");
     $db->exec("DROP TABLE IF EXISTS tenants");
+    $db->exec("DROP TABLE IF EXISTS stalls");
+    $db->exec("DROP TABLE IF EXISTS sections");
     $db->exec("DROP TABLE IF EXISTS users");
     
     echo "✅ Old tables dropped\n";
@@ -37,7 +39,8 @@ try {
         CREATE TABLE tenants (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER UNIQUE,
-            stall_number TEXT UNIQUE NOT NULL,
+            stall_id INTEGER,
+            stall_number TEXT NOT NULL,
             name TEXT NOT NULL,
             section TEXT,
             contact TEXT,
@@ -98,6 +101,39 @@ try {
     ");
     echo "✅ Notifications table created\n";
     
+    // Create sections table
+    $db->exec("
+        CREATE TABLE sections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            icon TEXT DEFAULT 'store',
+            display_order INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ");
+    echo "✅ Sections table created\n";
+    
+    // Create stalls table
+    $db->exec("
+        CREATE TABLE stalls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stall_number TEXT UNIQUE NOT NULL,
+            section TEXT NOT NULL,
+            monthly_rent REAL DEFAULT 0,
+            status TEXT DEFAULT 'available',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ");
+    echo "✅ Stalls table created\n";
+    
+    // Insert default sections
+    $db->exec("INSERT INTO sections (name, icon, display_order) VALUES ('Meat Section', 'drumstick-bite', 1)");
+    $db->exec("INSERT INTO sections (name, icon, display_order) VALUES ('Fish Section', 'fish', 2)");
+    $db->exec("INSERT INTO sections (name, icon, display_order) VALUES ('Vegetable Section', 'carrot', 3)");
+    $db->exec("INSERT INTO sections (name, icon, display_order) VALUES ('Dry Goods', 'box', 4)");
+    $db->exec("INSERT INTO sections (name, icon, display_order) VALUES ('Rice Section', 'seedling', 5)");
+    echo "✅ Default sections added\n";
+    
     // Insert ONLY the admin user (no sample tenants)
     $hashed_password = password_hash('admin123', PASSWORD_DEFAULT);
     $stmt = $db->prepare("INSERT INTO users (username, password, name, role, status) VALUES (?, ?, ?, 'admin', 'active')");
@@ -111,6 +147,7 @@ try {
     echo "  Password: admin123\n\n";
     echo "⚠️  No sample tenants created.\n";
     echo "Tenants must register through the public registration page.\n";
+    echo "Stalls must be added through admin/manage-stalls.php\n";
     echo "====================================\n";
     
 } catch (PDOException $e) {

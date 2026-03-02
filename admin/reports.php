@@ -739,6 +739,12 @@ $collectionRate = $totalTenants > 0 ? round(($totalPayments / ($totalTenants * 1
                         <span>Financial Reports</span>
                     </a>
                 </li>
+                <li class="nav-item">
+                    <a href="manage-stalls.php" class="nav-link">
+                        <i class="fas fa-cogs"></i>
+                        <span>Manage Stalls</span>
+                    </a>
+                </li>
             </ul>
 
             <div class="nav-section">MANAGEMENT</div>
