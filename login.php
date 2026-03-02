@@ -3,8 +3,11 @@ require_once 'config.php';
 
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $db = getDB();
-    $stmt = $db->prepare("SELECT * FROM users WHERE username = ?");
-    $stmt->execute([$_POST['username']]);
+    $login_input = trim($_POST['username']);
+    
+    // Check if input is email or username - try both
+    $stmt = $db->prepare("SELECT * FROM users WHERE username = ? OR email = ?");
+    $stmt->execute([$login_input, $login_input]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
     
     if ($user && password_verify($_POST['password'], $user['password'])) {
@@ -27,7 +30,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 if ($user['role'] == 'admin') {
                     header("Location: admin/dashboard.php");
                 } else {
-                    header("Location: tenant/dashboard.php");
+                    header("Location: user/dashboard.php");
                 }
                 exit;
             }
@@ -43,12 +46,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             if ($user['role'] == 'admin') {
                 header("Location: admin/dashboard.php");
             } else {
-                header("Location: tenant/dashboard.php");
+                header("Location: user/dashboard.php");
             }
             exit;
         }
     } else {
-        $error = "Invalid username or password";
+        $error = "Invalid username/email or password";
     }
 }
 ?>
@@ -358,10 +361,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             
             <form method="POST">
                 <div class="form-group">
-                    <label>Username</label>
+                    <label>Username or Email</label>
                     <div class="input-group">
                         <i class="fas fa-user"></i>
-                        <input type="text" name="username" required placeholder="Enter your username">
+                        <input type="text" name="username" required placeholder="Enter username or email">
                     </div>
                 </div>
                 

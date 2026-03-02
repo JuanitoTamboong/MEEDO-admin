@@ -1,19 +1,11 @@
-# TODO - Fix Stall Display in Tenant Registration
+# TODO - Fix Registration and Login Issues
 
-## Task: Show only available stalls in tenant registration page
+## Issues Fixed:
+- [x] 1. Wrong redirect path in tenant-register.php (tenant/dashboard.php → user/dashboard.php)
+- [x] 2. Wrong redirect path in login.php (tenant/dashboard.php → user/dashboard.php)  
+- [x] 3. Show generated username after successful registration
+- [x] 4. Allow login with email OR username
 
-### Issue:
-- Currently tenant-register.php shows ALL stalls (both available and occupied)
-- User wants it to show only stalls with status='available' in the database
-
-### Plan:
-- [x] Analyze existing code in admin/manage-stalls.php and tenant-register.php
-- [ ] Modify tenant-register.php SQL query to filter by status='available'
-- [ ] Update PHP code to only show available stalls
-- [ ] Update JavaScript to handle only available stalls
-- [ ] Test the changes
-
-### Files to Edit:
-- tenant-register.php
-  - Update SQL query to filter: WHERE s.status = 'available' AND t.id IS NULL
-  - Remove occupied stall display logic since only available will show
+## Files Edited:
+1. tenant-register.php - Fixed redirect path, shows username in success message
+2. login.php - Fixed redirect path, allows email login, updated label and placeholder

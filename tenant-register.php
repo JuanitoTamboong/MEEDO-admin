@@ -6,7 +6,7 @@ if (isset($_SESSION['user_id'])) {
     if (isAdmin()) {
         header("Location: admin/dashboard.php");
     } else {
-        header("Location: tenant/dashboard.php");
+        header("Location: user/dashboard.php");
     }
     exit;
 }
@@ -30,7 +30,8 @@ $stalls = $db->query("
     SELECT s.*, 
            t.name as tenant_name, 
            t.status as tenant_status,
-           t.id as tenant_id
+           t.id as tenant_id,
+           s.monthly_rent as stall_rent
     FROM stalls s
     LEFT JOIN tenants t ON s.id = t.stall_id AND t.status IN ('active', 'pending')
     WHERE s.status = 'available' AND t.id IS NULL
@@ -43,6 +44,16 @@ foreach ($stalls as $stall) {
     $stallsBySection[$stall['section']][] = $stall;
 }
 
+// Get all stalls with prices for JavaScript
+$allStallsJson = json_encode(array_map(function($s) {
+    return [
+        'id' => $s['id'],
+        'stall_number' => $s['stall_number'],
+        'section' => $s['section'],
+        'monthly_rent' => floatval($s['monthly_rent'])
+    ];
+}, $stalls));
+
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $name = trim($_POST['name']);
     $email = trim($_POST['email']);
@@ -50,11 +61,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $confirm_password = $_POST['confirm_password'];
     $contact = trim($_POST['contact']);
     $stall_id = intval($_POST['stall_id']);
-    $monthly_rent = floatval($_POST['monthly_rent']);
     
-    // Validation
-    if (empty($name) || empty($email) || empty($password) || empty($contact) || empty($stall_id) || empty($monthly_rent)) {
-        $error = "All fields are required";
+    // Validation - no need for monthly_rent input anymore
+    if (empty($name) || empty($email) || empty($password) || empty($contact) || empty($stall_id)) {
+        $error = "All fields are required. Please select a stall.";
     } elseif ($password !== $confirm_password) {
         $error = "Passwords do not match";
     } elseif (strlen($password) < 6) {
@@ -66,7 +76,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         if ($stmt->fetch()) {
             $error = "Email already registered";
         } else {
-            // Check if stall is still available
+            // Check if stall is still available and get its monthly rent
             $stmt = $db->prepare("
                 SELECT s.*, t.id as tenant_id 
                 FROM stalls s
@@ -79,6 +89,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             if (!$stall) {
                 $error = "This stall is no longer available. Please select another stall.";
             } else {
+                // Get monthly rent from the stall (automatic - no manual entry needed)
+                $monthly_rent = floatval($stall['monthly_rent']);
+                
                 // Begin transaction
                 $db->beginTransaction();
                 try {
@@ -91,7 +104,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     $stmt->execute([$username, $name, $email, $hashed_password]);
                     $user_id = $db->lastInsertId();
                     
-                    // Create tenant record
+                    // Create tenant record - using stall's monthly rent automatically
                     $stmt = $db->prepare("
                         INSERT INTO tenants (user_id, name, stall_number, section, monthly_rent, contact, email, status) 
                         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
@@ -109,13 +122,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         createNotification(
                             $admin['id'],
                             'New Tenant Registration',
-                            "New tenant registration pending: $name (Stall {$stall['stall_number']})",
+                            "New tenant registration pending: $name (Stall {$stall['stall_number']} - ₱" . number_format($monthly_rent, 2) . "/month)",
                             'info'
                         );
                     }
                     
                     $db->commit();
-                    $success = "Registration successful! Please proceed to the MEEDO office for payment and account approval.";
+                    $success = "Registration successful!<br><strong>Your Username:</strong> <code>" . htmlspecialchars($username) . "</code><br><strong>Monthly Rent:</strong> ₱" . number_format($monthly_rent, 2) . " per month.<br>Please proceed to the MEEDO office for payment and account approval.";
                     
                     // Clear form
                     $_POST = array();
@@ -341,6 +354,56 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             line-height: 1.6;
         }
 
+        /* Selected Stall Info Box */
+        .selected-stall-info {
+            background: linear-gradient(135deg, #ecfdf5, #d1fae5);
+            border-radius: 16px;
+            padding: 16px 20px;
+            margin-bottom: 24px;
+            display: none;
+            border: 1px solid #6ee7b7;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .selected-stall-info.show {
+            display: flex;
+        }
+
+        .selected-stall-info .stall-icon {
+            width: 48px;
+            height: 48px;
+            background: var(--success);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 20px;
+        }
+
+        .selected-stall-info .stall-details {
+            flex: 1;
+        }
+
+        .selected-stall-info .stall-details h4 {
+            color: #065f46;
+            font-size: 16px;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .selected-stall-info .stall-details p {
+            color: #047857;
+            font-size: 14px;
+        }
+
+        .selected-stall-info .rent-amount {
+            font-size: 24px;
+            font-weight: 800;
+            color: var(--success);
+        }
+
         /* Form Layout */
         .form-grid {
             display: grid;
@@ -552,6 +615,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         .stall-number {
             font-weight: 700;
             font-size: 12px;
+        }
+
+        .stall-rent {
+            font-size: 10px;
+            color: var(--success);
+            font-weight: 600;
+        }
+
+        .stall-item.selected .stall-rent {
+            color: rgba(255, 255, 255, 0.9);
         }
 
         .stall-status-badge {
@@ -792,6 +865,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 </div>
             </div>
 
+            <!-- Selected Stall Info -->
+            <div class="selected-stall-info" id="selectedStallInfo">
+                <div class="stall-icon">
+                    <i class="fas fa-check-circle"></i>
+                </div>
+                <div class="stall-details">
+                    <h4 id="selectedStallName">Stall Selected</h4>
+                    <p id="selectedStallSection">Section</p>
+                </div>
+                <div class="rent-amount" id="selectedStallRent">₱0.00/mo</div>
+            </div>
+
             <!-- Alerts -->
             <?php if ($error): ?>
                 <div class="alert error">
@@ -837,7 +922,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
                     <!-- Stall Selection -->
                     <div class="form-group full-width">
-                        <label>Select Your Stall</label>
+                        <label>Select Your Stall (Price is automatic)</label>
                         <div class="stall-selection">
                             <!-- Section Tabs -->
                             <div class="section-tabs" id="sectionTabs">
@@ -884,17 +969,24 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                                 $isOccupied = !is_null($stall['tenant_id']);
                                                 $tenantName = $stall['tenant_name'] ?? '';
                                                 $tenantStatus = $stall['tenant_status'] ?? '';
+                                                $stallRent = floatval($stall['monthly_rent']);
                                             ?>
                                                 <div class="stall-item <?php 
                                                     echo $isOccupied ? 'occupied' : ''; 
                                                     echo (!$isOccupied && isset($_POST['stall_id']) && $_POST['stall_id'] == $stall['id']) ? ' selected' : '';
                                                 ?>" 
-                                                     onclick="<?php echo !$isOccupied ? "selectStall({$stall['id']}, '{$stall['stall_number']}', this)" : ''; ?>">
+                                                     onclick="<?php echo !$isOccupied ? "selectStall({$stall['id']}, '{$stall['stall_number']}', '{$stall['section']}', {$stallRent}, this)" : ''; ?>"
+                                                     data-stall-id="<?php echo $stall['id']; ?>"
+                                                     data-monthly-rent="<?php echo $stallRent; ?>">
                                                     
                                                     <!-- Tooltip -->
                                                     <?php if ($isOccupied): ?>
                                                         <div class="stall-tooltip">
                                                             Occupied by: <?php echo $tenantName; ?> (<?php echo $tenantStatus; ?>)
+                                                        </div>
+                                                    <?php else: ?>
+                                                        <div class="stall-tooltip">
+                                                            ₱<?php echo number_format($stallRent, 2); ?>/month
                                                         </div>
                                                     <?php endif; ?>
                                                     
@@ -911,6 +1003,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                                     
                                                     <!-- Stall Number -->
                                                     <span class="stall-number"><?php echo $stall['stall_number']; ?></span>
+                                                    
+                                                    <!-- Rent Display -->
+                                                    <span class="stall-rent">₱<?php echo number_format($stallRent, 0); ?></span>
                                                     
                                                     <!-- Status Badge -->
                                                     <span class="stall-status-badge">
@@ -930,15 +1025,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     </div>
 
                     <input type="hidden" name="stall_id" id="selectedStallId" value="<?php echo isset($_POST['stall_id']) ? htmlspecialchars($_POST['stall_id']) : ''; ?>">
-
-                    <!-- Monthly Rent -->
-                    <div class="form-group full-width">
-                        <label>Monthly Rent (₱)</label>
-                        <div class="input-wrapper">
-                            <i class="fas fa-tag"></i>
-                            <input type="number" step="0.01" min="0" name="monthly_rent" required value="<?php echo isset($_POST['monthly_rent']) ? htmlspecialchars($_POST['monthly_rent']) : ''; ?>" placeholder="0.00">
-                        </div>
-                    </div>
 
                     <!-- Password Fields -->
                     <div class="form-group">
@@ -981,9 +1067,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     <script>
         let currentSection = '<?php echo $sections[0]['name'] ?? ''; ?>';
         let selectedStallId = null;
+        let selectedStallRent = 0;
+
+        // Stall data from PHP
+        const allStalls = <?php echo $allStallsJson; ?>;
 
         // Initialize on load
         document.addEventListener('DOMContentLoaded', function() {
+            console.log('Sections:', currentSection);
+            console.log('Stalls:', allStalls);
+            
             if (currentSection) {
                 updateAvailableCount(currentSection);
             }
@@ -1031,10 +1124,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             updateAvailableCount(section);
         }
 
-        // Select stall
-        function selectStall(stallId, stallNumber, element) {
-            // Remove selected class from all stalls in current section
-            document.querySelectorAll('#stalls-' + currentSection.replace(/[^a-zA-Z0-9]/g, '') + ' .stall-item').forEach(item => {
+        // Select stall - now includes rent
+        function selectStall(stallId, stallNumber, section, monthlyRent, element) {
+            // Remove selected class from all stalls
+            document.querySelectorAll('.stall-item').forEach(item => {
                 item.classList.remove('selected');
             });
             
@@ -1044,6 +1137,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             // Update hidden input
             document.getElementById('selectedStallId').value = stallId;
             selectedStallId = stallId;
+            selectedStallRent = monthlyRent;
+            
+            // Show selected stall info
+            const stallInfo = document.getElementById('selectedStallInfo');
+            document.getElementById('selectedStallName').textContent = 'Stall ' + stallNumber;
+            document.getElementById('selectedStallSection').textContent = section;
+            document.getElementById('selectedStallRent').textContent = '₱' + monthlyRent.toLocaleString('en-US', {minimumFractionDigits: 2}) + '/mo';
+            stallInfo.classList.add('show');
             
             // Visual feedback
             element.style.transform = 'scale(0.95)';
@@ -1064,20 +1165,19 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             }
         }
 
-        // Form validation
+        // Form validation - simplified
         document.getElementById('registrationForm').addEventListener('submit', function(e) {
-            const submitBtn = document.getElementById('submitBtn');
+            const form = this;
             const selectedStall = document.getElementById('selectedStallId').value;
             
             if (!selectedStall) {
                 e.preventDefault();
                 alert('Please select a stall from the available options');
-                return;
+                return true;
             }
             
-            // Show loading state
-            submitBtn.disabled = true;
-            submitBtn.innerHTML = '<span class="loading"></span> Processing...';
+            // Allow form to submit normally - remove the loading state blocking
+            console.log('Form submitting with stall_id:', selectedStall);
         });
 
         // Password strength indicator
