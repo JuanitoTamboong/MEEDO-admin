@@ -5,8 +5,17 @@ function getDB() {
     try {
         $db = new PDO('sqlite:' . __DIR__ . '/database.sqlite');
         $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        
+        // Enable WAL mode for better concurrency and prevent database locking
+        $db->exec('PRAGMA journal_mode = wal');
+        $db->exec('PRAGMA synchronous = NORMAL');
+        $db->exec('PRAGMA foreign_keys = ON');
+        $db->exec('PRAGMA busy_timeout = 5000'); // Wait up to 5 seconds when database is busy
+        
         return $db;
     } catch (PDOException $e) {
+        error_log("Database connection failed: " . $e->getMessage());
         die("Connection failed: " . $e->getMessage());
     }
 }
@@ -188,5 +197,217 @@ function getStatistics() {
 
 function peso($amount) {
     return formatMoney($amount);
+}
+
+// Helper function to execute queries with retry logic for locked databases
+function executeWithRetry($db, $sql, $params = []) {
+    $maxRetries = 3;
+    $retryCount = 0;
+    
+    while ($retryCount < $maxRetries) {
+        try {
+            $stmt = $db->prepare($sql);
+            $stmt->execute($params);
+            return $stmt;
+        } catch (PDOException $e) {
+            if (strpos($e->getMessage(), 'database is locked') !== false) {
+                $retryCount++;
+                if ($retryCount >= $maxRetries) {
+                    throw $e;
+                }
+                // Exponential backoff
+                usleep(100000 * pow(2, $retryCount));
+            } else {
+                throw $e;
+            }
+        }
+    }
+}
+
+// Function to check if a table exists
+function tableExists($db, $tableName) {
+    $result = $db->query("SELECT name FROM sqlite_master WHERE type='table' AND name='$tableName'");
+    return $result->fetch() !== false;
+}
+
+// Function to get table columns
+function getTableColumns($db, $tableName) {
+    if (!tableExists($db, $tableName)) {
+        return [];
+    }
+    $columns = [];
+    $result = $db->query("PRAGMA table_info($tableName)");
+    while ($row = $result->fetch(PDO::FETCH_ASSOC)) {
+        $columns[$row['name']] = $row;
+    }
+    return $columns;
+}
+
+// Function to add column if not exists
+function addColumnIfNotExists($db, $tableName, $columnName, $columnDef) {
+    $columns = getTableColumns($db, $tableName);
+    if (!isset($columns[$columnName])) {
+        try {
+            $db->exec("ALTER TABLE $tableName ADD COLUMN $columnName $columnDef");
+            return true;
+        } catch (PDOException $e) {
+            error_log("Failed to add column $columnName to $tableName: " . $e->getMessage());
+            return false;
+        }
+    }
+    return false;
+}
+
+// Initialize database tables if they don't exist
+function initializeDatabase() {
+    $db = getDB();
+    
+    // Create users table
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            role TEXT DEFAULT 'tenant',
+            status TEXT DEFAULT 'active',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ");
+    
+    // Check and fix sections table
+    if (!tableExists($db, 'sections')) {
+        // Create sections table if it doesn't exist
+        $db->exec("
+            CREATE TABLE sections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT,
+                icon TEXT DEFAULT 'store',
+                display_order INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ");
+        echo "Created sections table<br>";
+    } else {
+        // Add missing columns to existing sections table
+        addColumnIfNotExists($db, 'sections', 'description', 'TEXT');
+        addColumnIfNotExists($db, 'sections', 'icon', "TEXT DEFAULT 'store'");
+        addColumnIfNotExists($db, 'sections', 'display_order', 'INTEGER DEFAULT 0');
+        addColumnIfNotExists($db, 'sections', 'created_at', 'DATETIME DEFAULT CURRENT_TIMESTAMP');
+    }
+    
+    // Create stalls table
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS stalls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stall_number TEXT NOT NULL,
+            section TEXT NOT NULL,
+            monthly_rent DECIMAL(10,2) NOT NULL,
+            status TEXT DEFAULT 'available',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (section) REFERENCES sections(name),
+            UNIQUE(stall_number, section)
+        )
+    ");
+    
+    // Create tenants table
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS tenants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE NOT NULL,
+            stall_id INTEGER UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            stall_number TEXT NOT NULL,
+            section TEXT NOT NULL,
+            monthly_rent DECIMAL(10,2) NOT NULL,
+            contact TEXT NOT NULL,
+            email TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (stall_id) REFERENCES stalls(id)
+        )
+    ");
+    
+    // Create payments table
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id INTEGER NOT NULL,
+            amount DECIMAL(10,2) NOT NULL,
+            month INTEGER NOT NULL,
+            year INTEGER NOT NULL,
+            payment_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'paid',
+            reference_number TEXT,
+            notes TEXT,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        )
+    ");
+    
+    // Create notifications table
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            type TEXT DEFAULT 'info',
+            is_read INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ");
+    
+    // Insert default sections if they don't exist
+    $sections = [
+        ['Meat Section', 'Fresh meat and poultry', 'drumstick-bite', 1],
+        ['Fish Section', 'Fresh fish and seafood', 'fish', 2],
+        ['Vegetable Section', 'Fresh vegetables and fruits', 'carrot', 3],
+        ['Dry Goods', 'Rice, canned goods, and other dry items', 'box', 4],
+        ['Rice Section', 'Rice and grains', 'seedling', 5]
+    ];
+    
+    // Check if sections already have data
+    $count = $db->query("SELECT COUNT(*) FROM sections")->fetchColumn();
+    
+    if ($count == 0) {
+        // Insert sections only if table is empty
+        $insertStmt = $db->prepare("INSERT INTO sections (name, description, icon, display_order) VALUES (?, ?, ?, ?)");
+        foreach ($sections as $section) {
+            try {
+                $insertStmt->execute($section);
+            } catch (PDOException $e) {
+                error_log("Failed to insert section: " . $e->getMessage());
+            }
+        }
+    }
+    
+    // Create default admin if not exists
+    $stmt = $db->prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
+    $stmt->execute();
+    if (!$stmt->fetch()) {
+        $hashed_password = password_hash('admin123', PASSWORD_DEFAULT);
+        $stmt = $db->prepare("INSERT INTO users (username, name, email, password, role, status) VALUES (?, ?, ?, ?, 'admin', 'active')");
+        $stmt->execute(['admin', 'System Administrator', 'admin@meedo.gov.ph', $hashed_password]);
+        
+        // Get the new admin ID
+        $adminId = $db->lastInsertId();
+        
+        // Create admin notification if notifications table exists
+        if (tableExists($db, 'notifications')) {
+            createNotification($adminId, 'Welcome to MEEDO', 'Your admin account has been created successfully. Default password: admin123', 'success');
+        }
+    }
+}
+
+// Call initialization on every page load
+try {
+    initializeDatabase();
+} catch (PDOException $e) {
+    error_log("Database initialization failed: " . $e->getMessage());
+    // Don't die here, just log the error
 }
 ?>

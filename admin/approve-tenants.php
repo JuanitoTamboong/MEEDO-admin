@@ -38,7 +38,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         
         $db->beginTransaction();
         try {
-            $stmt = $db->prepare("SELECT user_id, name, stall_number FROM tenants WHERE id = ?");
+            $stmt = $db->prepare("SELECT user_id, name, stall_number, stall_id FROM tenants WHERE id = ?");
             $stmt->execute([$tenant_id]);
             $tenant = $stmt->fetch(PDO::FETCH_ASSOC);
             
@@ -51,6 +51,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             
             $stmt = $db->prepare("UPDATE users SET status = 'active' WHERE id = ?");
             $stmt->execute([$tenant['user_id']]);
+            
+            // Update stall status from 'waiting' to 'occupied'
+            $stmt = $db->prepare("UPDATE stalls SET status = 'occupied' WHERE id = ? AND status = 'waiting'");
+            $stmt->execute([$tenant['stall_id']]);
             
             createNotification(
                 $tenant['user_id'],
@@ -72,7 +76,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         
         $db->beginTransaction();
         try {
-            $stmt = $db->prepare("SELECT user_id, name FROM tenants WHERE id = ?");
+            $stmt = $db->prepare("SELECT user_id, name, stall_id FROM tenants WHERE id = ?");
             $stmt->execute([$tenant_id]);
             $tenant = $stmt->fetch(PDO::FETCH_ASSOC);
             
@@ -80,14 +84,20 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 throw new Exception("Tenant not found");
             }
             
+            // First restore stall to available before deleting tenant
+            $stmt = $db->prepare("UPDATE stalls SET status = 'available' WHERE id = ? AND status = 'waiting'");
+            $stmt->execute([$tenant['stall_id']]);
+            
+            // Delete tenant record
             $stmt = $db->prepare("DELETE FROM tenants WHERE id = ?");
             $stmt->execute([$tenant_id]);
             
+            // Delete user record
             $stmt = $db->prepare("DELETE FROM users WHERE id = ?");
             $stmt->execute([$tenant['user_id']]);
             
             $db->commit();
-            $message = "Tenant registration rejected and removed.";
+            $message = "Tenant registration rejected. The stall is now available again.";
         } catch (Exception $e) {
             $db->rollBack();
             $error = "Error rejecting tenant: " . $e->getMessage();

@@ -25,7 +25,7 @@ $sections = $db->query("
     ORDER BY s.display_order, s.name
 ")->fetchAll(PDO::FETCH_ASSOC);
 
-// Get only AVAILABLE stalls (no active or pending tenant, and status is 'available')
+// Get only AVAILABLE stalls
 $stalls = $db->query("
     SELECT s.*, 
            t.name as tenant_name, 
@@ -37,12 +37,6 @@ $stalls = $db->query("
     WHERE s.status = 'available' AND t.id IS NULL
     ORDER BY s.section, s.stall_number
 ")->fetchAll(PDO::FETCH_ASSOC);
-
-// Group stalls by section
-$stallsBySection = [];
-foreach ($stalls as $stall) {
-    $stallsBySection[$stall['section']][] = $stall;
-}
 
 // Get all stalls with prices for JavaScript
 $allStallsJson = json_encode(array_map(function($s) {
@@ -62,7 +56,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $contact = trim($_POST['contact']);
     $stall_id = intval($_POST['stall_id']);
     
-    // Validation - no need for monthly_rent input anymore
     if (empty($name) || empty($email) || empty($password) || empty($contact) || empty($stall_id)) {
         $error = "All fields are required. Please select a stall.";
     } elseif ($password !== $confirm_password) {
@@ -70,13 +63,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     } elseif (strlen($password) < 6) {
         $error = "Password must be at least 6 characters";
     } else {
-        // Check if email already exists
         $stmt = $db->prepare("SELECT id FROM users WHERE email = ?");
         $stmt->execute([$email]);
         if ($stmt->fetch()) {
             $error = "Email already registered";
         } else {
-            // Check if stall is still available and get its monthly rent
             $stmt = $db->prepare("
                 SELECT s.*, t.id as tenant_id 
                 FROM stalls s
@@ -89,52 +80,86 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             if (!$stall) {
                 $error = "This stall is no longer available. Please select another stall.";
             } else {
-                // Get monthly rent from the stall (automatic - no manual entry needed)
                 $monthly_rent = floatval($stall['monthly_rent']);
                 
-                // Begin transaction
-                $db->beginTransaction();
-                try {
-                    // Create username from email
-                    $username = strtolower(explode('@', $email)[0]);
-                    
-                    // Create user account
-                    $hashed_password = password_hash($password, PASSWORD_DEFAULT);
-                    $stmt = $db->prepare("INSERT INTO users (username, name, email, password, role, status) VALUES (?, ?, ?, ?, 'tenant', 'pending')");
-                    $stmt->execute([$username, $name, $email, $hashed_password]);
-                    $user_id = $db->lastInsertId();
-                    
-                    // Create tenant record - using stall's monthly rent automatically
-                    $stmt = $db->prepare("
-                        INSERT INTO tenants (user_id, name, stall_number, section, monthly_rent, contact, email, status) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-                    ");
-                    $stmt->execute([$user_id, $name, $stall['stall_number'], $stall['section'], $monthly_rent, $contact, $email]);
-                    
-                    // Update stall status
-                    $stmt = $db->prepare("UPDATE stalls SET status = 'pending' WHERE id = ?");
-                    $stmt->execute([$stall_id]);
-                    
-                    // Create notification for admin
-                    $adminQuery = $db->query("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
-                    $admin = $adminQuery->fetch();
-                    if ($admin) {
-                        createNotification(
-                            $admin['id'],
-                            'New Tenant Registration',
-                            "New tenant registration pending: $name (Stall {$stall['stall_number']} - ₱" . number_format($monthly_rent, 2) . "/month)",
-                            'info'
-                        );
+                $maxRetries = 5;
+                $retryCount = 0;
+                $transactionCompleted = false;
+                
+                while (!$transactionCompleted && $retryCount < $maxRetries) {
+                    try {
+                        $db->beginTransaction();
+                        
+                        $username = strtolower(explode('@', $email)[0]);
+                        $baseUsername = $username;
+                        $counter = 1;
+                        
+                        while (true) {
+                            $stmt = $db->prepare("SELECT id FROM users WHERE username = ?");
+                            $stmt->execute([$username]);
+                            if (!$stmt->fetch()) {
+                                break;
+                            }
+                            $username = $baseUsername . $counter;
+                            $counter++;
+                        }
+                        
+                        $hashed_password = password_hash($password, PASSWORD_DEFAULT);
+                        $stmt = $db->prepare("INSERT INTO users (username, name, email, password, role, status) VALUES (?, ?, ?, ?, 'tenant', 'pending')");
+                        $stmt->execute([$username, $name, $email, $hashed_password]);
+                        $user_id = $db->lastInsertId();
+                        
+                        $stmt = $db->prepare("
+                            INSERT INTO tenants (user_id, stall_id, name, stall_number, section, monthly_rent, contact, email, status) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                        ");
+                        $stmt->execute([$user_id, $stall_id, $name, $stall['stall_number'], $stall['section'], $monthly_rent, $contact, $email]);
+                        
+                        $stmt = $db->prepare("UPDATE stalls SET status = 'waiting' WHERE id = ?");
+                        $stmt->execute([$stall_id]);
+                        
+                        $adminQuery = $db->query("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
+                        $admin = $adminQuery->fetch();
+                        if ($admin) {
+                            createNotification(
+                                $admin['id'],
+                                'New Tenant Registration',
+                                "New tenant registration pending: $name (Stall {$stall['stall_number']} - ₱" . number_format($monthly_rent, 2) . "/month)",
+                                'info'
+                            );
+                        }
+                        
+                        $db->commit();
+                        $transactionCompleted = true;
+                        
+                        $success = "Registration successful!<br><strong>Your Username:</strong> <code>" . htmlspecialchars($username) . "</code><br><strong>Monthly Rent:</strong> ₱" . number_format($monthly_rent, 2) . " per month.<br>Please proceed to the MEEDO office for payment and account approval.";
+                        
+                        $_POST = array();
+                        
+                    } catch (Exception $e) {
+                        if ($db->inTransaction()) {
+                            $db->rollBack();
+                        }
+                        
+                        if (strpos($e->getMessage(), 'database is locked') !== false) {
+                            $retryCount++;
+                            if ($retryCount >= $maxRetries) {
+                                error_log("Registration failed after $maxRetries retries: " . $e->getMessage());
+                                $error = "The system is currently busy. Please try again in a few moments.";
+                            } else {
+                                $waitTime = 200000 * pow(2, $retryCount);
+                                usleep($waitTime);
+                            }
+                        } else {
+                            error_log("Registration Error: " . $e->getMessage());
+                            $error = "Registration failed: " . $e->getMessage();
+                            break;
+                        }
                     }
-                    
-                    $db->commit();
-                    $success = "Registration successful!<br><strong>Your Username:</strong> <code>" . htmlspecialchars($username) . "</code><br><strong>Monthly Rent:</strong> ₱" . number_format($monthly_rent, 2) . " per month.<br>Please proceed to the MEEDO office for payment and account approval.";
-                    
-                    // Clear form
-                    $_POST = array();
-                } catch (Exception $e) {
-                    $db->rollBack();
-                    $error = "Registration failed. Please try again.";
+                }
+                
+                if (!$transactionCompleted && empty($error)) {
+                    $error = "The system is temporarily busy. Please try again in a few moments.";
                 }
             }
         }
@@ -146,9 +171,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tenant Registration | MEEDO Market System</title>
+    <title>Register as Tenant | MEEDO Market</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
     <style>
         * {
             margin: 0;
@@ -156,135 +181,65 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             box-sizing: border-box;
         }
 
-        :root {
-            --primary: #0f172a;
-            --primary-light: #1e293b;
-            --accent: #3b82f6;
-            --accent-gradient: linear-gradient(135deg, #3b82f6, #8b5cf6);
-            --success: #10b981;
-            --warning: #f59e0b;
-            --danger: #ef4444;
-            --surface: #ffffff;
-            --background: #f8fafc;
-            --text-primary: #0f172a;
-            --text-secondary: #475569;
-            --text-tertiary: #64748b;
-            --border: #e2e8f0;
-            --border-light: #f1f5f9;
-            --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
-            --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
-            --shadow-md: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
-            --shadow-lg: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
-            --shadow-xl: 0 25px 50px -12px rgb(0 0 0 / 0.25);
-        }
-
         body {
-            font-family: 'Plus Jakarta Sans', sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Inter', sans-serif;
+            background: #f9fafb;
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
             padding: 20px;
-            position: relative;
         }
 
-        body::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" opacity="0.1"><circle cx="50" cy="50" r="40" fill="none" stroke="white" stroke-width="2"/></svg>') repeat;
-            pointer-events: none;
-        }
-
-        .register-container {
+        .register-wrapper {
             max-width: 1200px;
             width: 100%;
-            position: relative;
-            z-index: 1;
         }
 
-        /* Header Styles */
+        /* Header */
         .header {
             text-align: center;
             margin-bottom: 30px;
-            animation: slideDown 0.5s ease;
-        }
-
-        @keyframes slideDown {
-            from {
-                opacity: 0;
-                transform: translateY(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
         }
 
         .logo {
             display: inline-flex;
             align-items: center;
-            gap: 16px;
-            background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(10px);
-            padding: 16px 32px;
-            border-radius: 60px;
-            box-shadow: var(--shadow-xl);
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            gap: 12px;
+            background: white;
+            padding: 12px 30px;
+            border-radius: 100px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
         }
 
         .logo-icon {
-            width: 56px;
-            height: 56px;
-            background: var(--accent-gradient);
-            border-radius: 16px;
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            border-radius: 10px;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
-            font-size: 28px;
-            box-shadow: var(--shadow-md);
+            font-size: 20px;
         }
 
         .logo-text {
-            font-weight: 800;
-            font-size: 28px;
-            background: linear-gradient(135deg, var(--primary), var(--accent));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+            font-weight: 700;
+            font-size: 22px;
+            color: #1e293b;
         }
 
         .logo-text span {
-            background: linear-gradient(135deg, var(--accent), #8b5cf6);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            color: #3b82f6;
         }
 
         /* Main Card */
         .register-card {
-            background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(10px);
-            border-radius: 40px;
+            background: white;
+            border-radius: 32px;
             padding: 40px;
-            box-shadow: var(--shadow-xl);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            animation: fadeIn 0.5s ease 0.2s both;
-        }
-
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+            box-shadow: 0 20px 40px -10px rgba(0,0,0,0.1);
         }
 
         .card-header {
@@ -292,131 +247,189 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         }
 
         .card-header h2 {
-            font-size: 32px;
-            font-weight: 800;
-            color: var(--text-primary);
+            font-size: 28px;
+            font-weight: 700;
+            color: #1e293b;
             margin-bottom: 8px;
-            letter-spacing: -0.5px;
         }
 
-        .subtitle {
-            color: var(--text-secondary);
+        .card-header p {
+            color: #64748b;
             font-size: 15px;
+        }
+
+        /* Steps */
+        .steps {
             display: flex;
             align-items: center;
             gap: 8px;
-            padding-bottom: 20px;
-            border-bottom: 1px solid var(--border-light);
+            margin: 20px 0 30px;
         }
 
-        .subtitle i {
-            color: var(--accent);
-        }
-
-        /* Info Box */
-        .info-box {
-            background: linear-gradient(135deg, #eff6ff, #e0f2fe);
-            border-radius: 20px;
-            padding: 20px 24px;
-            margin-bottom: 30px;
+        .step {
+            flex: 1;
             display: flex;
-            gap: 16px;
-            border: 1px solid #bae6fd;
+            align-items: center;
+            gap: 8px;
         }
 
-        .info-icon {
-            width: 48px;
-            height: 48px;
-            background: white;
-            border-radius: 14px;
+        .step:not(:last-child)::after {
+            content: '';
+            flex: 1;
+            height: 2px;
+            background: #e2e8f0;
+        }
+
+        .step-number {
+            width: 32px;
+            height: 32px;
+            background: #f1f5f9;
+            border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
-            color: var(--accent);
-            font-size: 20px;
-            box-shadow: var(--shadow-sm);
+            font-weight: 600;
+            font-size: 14px;
+            color: #64748b;
         }
 
-        .info-content {
-            flex: 1;
+        .step.active .step-number {
+            background: #3b82f6;
+            color: white;
+        }
+
+        .step-text {
+            font-size: 13px;
+            font-weight: 500;
+            color: #64748b;
+        }
+
+        .step.active .step-text {
+            color: #1e293b;
+        }
+
+        /* Info Grid */
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .info-item {
+            background: #f8fafc;
+            border-radius: 16px;
+            padding: 15px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .info-icon {
+            width: 40px;
+            height: 40px;
+            background: white;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #3b82f6;
         }
 
         .info-content h4 {
-            color: #0369a1;
-            font-size: 16px;
-            font-weight: 700;
+            font-size: 14px;
+            font-weight: 600;
+            color: #1e293b;
             margin-bottom: 4px;
         }
 
         .info-content p {
-            color: #0284c7;
-            font-size: 14px;
-            line-height: 1.6;
+            font-size: 12px;
+            color: #64748b;
         }
 
-        /* Selected Stall Info Box */
-        .selected-stall-info {
-            background: linear-gradient(135deg, #ecfdf5, #d1fae5);
+        /* Selected Stall */
+        .selected-stall {
+            background: #f0f9ff;
+            border: 1px solid #bae6fd;
             border-radius: 16px;
-            padding: 16px 20px;
-            margin-bottom: 24px;
+            padding: 15px 20px;
+            margin-bottom: 25px;
             display: none;
-            border: 1px solid #6ee7b7;
             align-items: center;
-            gap: 16px;
+            justify-content: space-between;
         }
 
-        .selected-stall-info.show {
+        .selected-stall.show {
             display: flex;
         }
 
-        .selected-stall-info .stall-icon {
-            width: 48px;
-            height: 48px;
-            background: var(--success);
-            border-radius: 12px;
+        .selected-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .selected-icon {
+            width: 45px;
+            height: 45px;
+            background: #3b82f6;
+            border-radius: 10px;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
-            font-size: 20px;
         }
 
-        .selected-stall-info .stall-details {
-            flex: 1;
-        }
-
-        .selected-stall-info .stall-details h4 {
-            color: #065f46;
+        .selected-details h3 {
             font-size: 16px;
+            font-weight: 600;
+            color: #1e293b;
+        }
+
+        .selected-details p {
+            font-size: 13px;
+            color: #64748b;
+        }
+
+        .selected-rent {
+            font-size: 20px;
             font-weight: 700;
-            margin-bottom: 4px;
+            color: #3b82f6;
         }
 
-        .selected-stall-info .stall-details p {
-            color: #047857;
+        /* Alerts */
+        .alert {
+            padding: 14px 16px;
+            border-radius: 12px;
+            margin-bottom: 20px;
             font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
 
-        .selected-stall-info .rent-amount {
-            font-size: 24px;
-            font-weight: 800;
-            color: var(--success);
+        .alert.error {
+            background: #fef2f2;
+            color: #dc2626;
+            border: 1px solid #fee2e2;
         }
 
-        /* Form Layout */
+        .alert.success {
+            background: #f0fdf4;
+            color: #16a34a;
+            border: 1px solid #dcfce7;
+        }
+
+        /* Form Grid */
         .form-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 24px;
-            margin-bottom: 24px;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+            margin-bottom: 25px;
         }
 
-        .form-group {
-            margin-bottom: 4px;
-        }
-
-        .form-group.full-width {
+        .form-group.full {
             grid-column: 1 / -1;
         }
 
@@ -424,9 +437,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             display: block;
             font-size: 13px;
             font-weight: 600;
-            color: var(--text-secondary);
-            margin-bottom: 8px;
-            letter-spacing: 0.3px;
+            color: #475569;
+            margin-bottom: 6px;
         }
 
         .input-wrapper {
@@ -435,44 +447,34 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
         .input-wrapper i {
             position: absolute;
-            left: 16px;
+            left: 14px;
             top: 50%;
             transform: translateY(-50%);
-            color: var(--text-tertiary);
+            color: #94a3b8;
             font-size: 16px;
         }
 
-        .form-group input,
-        .form-group select {
+        .input-wrapper input {
             width: 100%;
-            padding: 14px 16px 14px 45px;
-            border: 1.5px solid var(--border);
-            border-radius: 16px;
+            padding: 12px 14px 12px 42px;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
             font-size: 14px;
-            font-family: 'Plus Jakarta Sans', sans-serif;
             transition: all 0.2s;
-            background: white;
         }
 
-        .form-group input:focus,
-        .form-group select:focus {
+        .input-wrapper input:focus {
             outline: none;
-            border-color: var(--accent);
-            box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.1);
+            border-color: #3b82f6;
+            box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
         }
 
-        .form-group input::placeholder {
-            color: var(--text-tertiary);
-            opacity: 0.7;
-        }
-
-        /* Stall Selection Area */
-        .stall-selection {
-            background: var(--background);
-            border-radius: 24px;
-            padding: 24px;
-            border: 1px solid var(--border-light);
-            margin: 20px 0;
+        /* Stall Selection */
+        .stall-section {
+            background: #f8fafc;
+            border-radius: 20px;
+            padding: 20px;
+            margin-top: 10px;
         }
 
         .section-tabs {
@@ -480,87 +482,74 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             gap: 10px;
             flex-wrap: wrap;
             margin-bottom: 20px;
-            padding-bottom: 20px;
-            border-bottom: 1px solid var(--border-light);
         }
 
-        .section-tab {
-            padding: 10px 20px;
+        .tab {
+            padding: 10px 18px;
             background: white;
-            border: 1px solid var(--border);
+            border: 1px solid #e2e8f0;
             border-radius: 40px;
             font-size: 13px;
-            font-weight: 600;
-            color: var(--text-secondary);
+            font-weight: 500;
+            color: #64748b;
             cursor: pointer;
-            transition: all 0.2s;
             display: flex;
             align-items: center;
             gap: 8px;
+            transition: all 0.2s;
         }
 
-        .section-tab i {
-            font-size: 14px;
+        .tab:hover {
+            border-color: #3b82f6;
+            color: #3b82f6;
         }
 
-        .section-tab:hover {
-            border-color: var(--accent);
-            color: var(--accent);
-            transform: translateY(-2px);
-            box-shadow: var(--shadow);
-        }
-
-        .section-tab.active {
-            background: var(--accent-gradient);
-            border-color: transparent;
+        .tab.active {
+            background: #3b82f6;
+            border-color: #3b82f6;
             color: white;
-            box-shadow: 0 8px 16px -4px rgba(59, 130, 246, 0.3);
         }
 
-        .stall-counter {
+        .tab.active i {
+            color: white;
+        }
+
+        .stall-stats {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 16px;
+            margin-bottom: 15px;
         }
 
-        .counter-label {
-            font-weight: 600;
-            color: var(--text-secondary);
-            font-size: 14px;
-        }
-
-        .counter-badge {
-            background: white;
-            padding: 8px 16px;
-            border-radius: 40px;
+        .stats-label {
             font-size: 13px;
-            font-weight: 600;
-            color: var(--success);
-            border: 1px solid var(--border);
-            box-shadow: var(--shadow-sm);
+            font-weight: 500;
+            color: #64748b;
         }
 
-        .counter-badge i {
-            margin-right: 6px;
+        .stats-badge {
+            background: #3b82f6;
+            color: white;
+            padding: 5px 14px;
+            border-radius: 30px;
+            font-size: 12px;
+            font-weight: 600;
         }
 
         .stall-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
-            gap: 12px;
+            gap: 10px;
             max-height: 300px;
             overflow-y: auto;
-            padding: 8px;
-            border-radius: 16px;
-            background: white;
+            padding: 5px;
         }
 
         .stall-item {
             background: white;
-            border: 1px solid var(--border);
+            border: 1px solid #e2e8f0;
             border-radius: 12px;
-            padding: 12px 8px;
+            padding: 12px 5px;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -571,269 +560,189 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         }
 
         .stall-item:hover:not(.occupied) {
-            border-color: var(--accent);
+            border-color: #3b82f6;
             transform: translateY(-2px);
-            box-shadow: var(--shadow);
+            box-shadow: 0 5px 15px -5px rgba(59,130,246,0.3);
         }
 
         .stall-item.selected {
-            background: var(--accent-gradient);
-            border-color: transparent;
+            background: #3b82f6;
+            border-color: #3b82f6;
             color: white;
-            box-shadow: 0 8px 16px -4px rgba(59, 130, 246, 0.3);
         }
 
         .stall-item.occupied {
             background: #fef2f2;
             border-color: #fee2e2;
-            color: var(--danger);
+            color: #dc2626;
             cursor: not-allowed;
             opacity: 0.7;
         }
 
         .stall-icon {
-            width: 40px;
-            height: 40px;
-            background: var(--background);
-            border-radius: 10px;
+            width: 35px;
+            height: 35px;
+            background: #f1f5f9;
+            border-radius: 8px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 18px;
+            font-size: 16px;
         }
 
         .stall-item.selected .stall-icon {
-            background: rgba(255, 255, 255, 0.2);
+            background: rgba(255,255,255,0.2);
             color: white;
         }
 
-        .stall-item.occupied .stall-icon {
-            background: #fee2e2;
-            color: var(--danger);
-        }
-
         .stall-number {
-            font-weight: 700;
+            font-weight: 600;
             font-size: 12px;
         }
 
         .stall-rent {
-            font-size: 10px;
-            color: var(--success);
+            font-size: 11px;
             font-weight: 600;
+            color: #10b981;
         }
 
         .stall-item.selected .stall-rent {
-            color: rgba(255, 255, 255, 0.9);
+            color: rgba(255,255,255,0.9);
         }
 
-        .stall-status-badge {
-            font-size: 9px;
-            padding: 3px 6px;
-            border-radius: 30px;
-            background: var(--background);
-            color: var(--text-secondary);
-            font-weight: 600;
+        /* Password Strength */
+        .strength-meter {
+            margin-top: 8px;
         }
 
-        .stall-item.selected .stall-status-badge {
-            background: rgba(255, 255, 255, 0.2);
-            color: white;
+        .strength-bars {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 4px;
         }
 
-        .stall-tooltip {
-            position: absolute;
-            bottom: 100%;
-            left: 50%;
-            transform: translateX(-50%);
-            background: var(--text-primary);
-            color: white;
-            padding: 6px 12px;
-            border-radius: 8px;
-            font-size: 11px;
-            white-space: nowrap;
-            opacity: 0;
-            visibility: hidden;
+        .strength-bar {
+            height: 4px;
+            flex: 1;
+            background: #e2e8f0;
+            border-radius: 4px;
             transition: all 0.2s;
-            pointer-events: none;
-            z-index: 10;
         }
 
-        .stall-item:hover .stall-tooltip {
-            opacity: 1;
-            visibility: visible;
-            bottom: calc(100% + 5px);
+        .strength-bar.weak { background: #ef4444; }
+        .strength-bar.fair { background: #f59e0b; }
+        .strength-bar.good { background: #10b981; }
+        .strength-bar.strong { background: #059669; }
+
+        .strength-text {
+            font-size: 11px;
+            font-weight: 500;
+            color: #64748b;
         }
 
-        /* Button */
-        .btn-register {
+        /* Submit Button */
+        .btn-submit {
             width: 100%;
-            padding: 18px;
-            background: var(--accent-gradient);
+            padding: 14px;
+            background: #3b82f6;
             color: white;
             border: none;
-            border-radius: 30px;
-            font-weight: 700;
-            font-size: 16px;
+            border-radius: 14px;
+            font-weight: 600;
+            font-size: 15px;
             cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: center;
-            gap: 12px;
-            margin: 30px 0 20px;
-            transition: all 0.3s;
-            box-shadow: var(--shadow-lg);
-            position: relative;
-            overflow: hidden;
+            gap: 10px;
+            margin: 25px 0 20px;
+            transition: all 0.2s;
         }
 
-        .btn-register::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-            transition: left 0.5s;
+        .btn-submit:hover {
+            background: #2563eb;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px -8px #3b82f6;
         }
 
-        .btn-register:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 20px 30px -10px rgba(59, 130, 246, 0.5);
-        }
-
-        .btn-register:hover::before {
-            left: 100%;
-        }
-
-        .btn-register i {
-            font-size: 18px;
-        }
-
-        /* Alerts */
-        .alert {
-            padding: 16px 20px;
-            border-radius: 16px;
-            margin-bottom: 20px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            font-size: 14px;
-            animation: slideIn 0.3s ease;
-        }
-
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateX(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        .alert.error {
-            background: #fef2f2;
-            color: var(--danger);
-            border: 1px solid #fee2e2;
-        }
-
-        .alert.success {
-            background: #f0fdf4;
-            color: var(--success);
-            border: 1px solid #dcfce7;
-        }
-
-        .alert i {
-            font-size: 20px;
+        .btn-submit i {
+            font-size: 16px;
         }
 
         /* Login Link */
         .login-link {
             text-align: center;
-            margin-top: 20px;
             padding-top: 20px;
-            border-top: 1px solid var(--border-light);
+            border-top: 1px solid #e2e8f0;
         }
 
         .login-link p {
-            color: var(--text-secondary);
+            color: #64748b;
             font-size: 14px;
+            margin-bottom: 8px;
         }
 
         .login-link a {
-            color: var(--accent);
+            color: #3b82f6;
             text-decoration: none;
             font-weight: 600;
-            margin-left: 5px;
-            transition: all 0.2s;
+            font-size: 14px;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
         }
 
         .login-link a:hover {
-            color: #8b5cf6;
             text-decoration: underline;
         }
 
-        /* Footer */
-        .footer-note {
-            text-align: center;
-            margin-top: 20px;
-            color: rgba(255, 255, 255, 0.9);
-            font-size: 13px;
-            font-weight: 500;
-            animation: fadeIn 0.5s ease 0.4s both;
-        }
-
-        .footer-note a {
-            color: white;
-            text-decoration: none;
-            font-weight: 600;
-        }
-
-        .footer-note a:hover {
-            text-decoration: underline;
-        }
-
-        /* Responsive */
-        @media (max-width: 768px) {
-            .register-card {
-                padding: 25px;
-            }
-
-            .form-grid {
-                grid-template-columns: 1fr;
-                gap: 16px;
-            }
-
-            .stall-grid {
-                grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
-            }
-
-            .logo-text {
-                font-size: 22px;
-            }
-        }
-
-        /* Loading Animation */
+        /* Loading */
         .loading {
             display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(255,255,255,.3);
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(255,255,255,0.3);
             border-radius: 50%;
             border-top-color: white;
-            animation: spin 1s ease-in-out infinite;
+            animation: spin 0.8s linear infinite;
         }
 
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+
+        /* Responsive */
+        @media (max-width: 700px) {
+            .register-card {
+                padding: 25px;
+            }
+            
+            .form-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .info-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .steps {
+                display: none;
+            }
+            
+            .selected-stall {
+                flex-direction: column;
+                gap: 10px;
+                text-align: center;
+            }
+            
+            .selected-info {
+                flex-direction: column;
+            }
+        }
     </style>
 </head>
 <body>
-    <div class="register-container">
+    <div class="register-wrapper">
         <!-- Header -->
         <div class="header">
             <div class="logo">
@@ -847,34 +756,69 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         <!-- Main Card -->
         <div class="register-card">
             <div class="card-header">
-                <h2>Tenant Registration</h2>
-                <div class="subtitle">
-                    <i class="fas fa-map-pin"></i>
-                    Odiongan Public Market · Municipal Enterprise Development Office
+                <h2>Become a Market Vendor</h2>
+                <p>Join Odiongan Public Market's growing community of entrepreneurs</p>
+            </div>
+
+            <!-- Steps -->
+            <div class="steps">
+                <div class="step active">
+                    <div class="step-number">1</div>
+                    <span class="step-text">Details</span>
+                </div>
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <span class="step-text">Select Stall</span>
+                </div>
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <span class="step-text">Confirm</span>
                 </div>
             </div>
 
-            <!-- Info Box -->
-            <div class="info-box">
-                <div class="info-icon">
-                    <i class="fas fa-info-circle"></i>
+            <!-- Info Grid -->
+            <div class="info-grid">
+                <div class="info-item">
+                    <div class="info-icon">
+                        <i class="fas fa-clock"></i>
+                    </div>
+                    <div class="info-content">
+                        <h4>Quick Process</h4>
+                        <p>Register in 2 minutes</p>
+                    </div>
                 </div>
-                <div class="info-content">
-                    <h4>Registration Process</h4>
-                    <p>After registration, please proceed to the MEEDO office for payment verification. Your account will be activated within 24 hours after payment confirmation. Select your preferred stall from the available options below.</p>
+                <div class="info-item">
+                    <div class="info-icon">
+                        <i class="fas fa-shield"></i>
+                    </div>
+                    <div class="info-content">
+                        <h4>Secure</h4>
+                        <p>Your data is safe</p>
+                    </div>
+                </div>
+                <div class="info-item">
+                    <div class="info-icon">
+                        <i class="fas fa-headset"></i>
+                    </div>
+                    <div class="info-content">
+                        <h4>Support</h4>
+                        <p>MEEDO assistance</p>
+                    </div>
                 </div>
             </div>
 
-            <!-- Selected Stall Info -->
-            <div class="selected-stall-info" id="selectedStallInfo">
-                <div class="stall-icon">
-                    <i class="fas fa-check-circle"></i>
+            <!-- Selected Stall -->
+            <div class="selected-stall" id="selectedStall">
+                <div class="selected-info">
+                    <div class="selected-icon">
+                        <i class="fas fa-check"></i>
+                    </div>
+                    <div class="selected-details">
+                        <h3 id="selectedName">Stall Selected</h3>
+                        <p id="selectedSection">Section</p>
+                    </div>
                 </div>
-                <div class="stall-details">
-                    <h4 id="selectedStallName">Stall Selected</h4>
-                    <p id="selectedStallSection">Section</p>
-                </div>
-                <div class="rent-amount" id="selectedStallRent">₱0.00/mo</div>
+                <div class="selected-rent" id="selectedRent">₱0.00/mo</div>
             </div>
 
             <!-- Alerts -->
@@ -892,68 +836,60 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 </div>
             <?php endif; ?>
 
-            <!-- Registration Form -->
-            <form method="POST" action="" id="registrationForm">
+            <!-- Form -->
+            <form method="POST" id="registrationForm">
                 <div class="form-grid">
-                    <!-- Personal Information -->
-                    <div class="form-group full-width">
+                    <div class="form-group full">
                         <label>Full Name</label>
                         <div class="input-wrapper">
                             <i class="fas fa-user"></i>
-                            <input type="text" name="name" required value="<?php echo isset($_POST['name']) ? htmlspecialchars($_POST['name']) : ''; ?>" placeholder="Enter your full name">
+                            <input type="text" name="name" required value="<?php echo isset($_POST['name']) ? htmlspecialchars($_POST['name']) : ''; ?>" placeholder="Juan Dela Cruz">
                         </div>
                     </div>
 
                     <div class="form-group">
-                        <label>Email Address</label>
+                        <label>Email</label>
                         <div class="input-wrapper">
                             <i class="fas fa-envelope"></i>
-                            <input type="email" name="email" required value="<?php echo isset($_POST['email']) ? htmlspecialchars($_POST['email']) : ''; ?>" placeholder="your@email.com">
+                            <input type="email" name="email" required value="<?php echo isset($_POST['email']) ? htmlspecialchars($_POST['email']) : ''; ?>" placeholder="juan@email.com">
                         </div>
                     </div>
 
                     <div class="form-group">
-                        <label>Contact Number</label>
+                        <label>Contact No.</label>
                         <div class="input-wrapper">
                             <i class="fas fa-phone"></i>
-                            <input type="text" name="contact" required value="<?php echo isset($_POST['contact']) ? htmlspecialchars($_POST['contact']) : ''; ?>" placeholder="09XXXXXXXXX">
+                            <input type="text" name="contact" required value="<?php echo isset($_POST['contact']) ? htmlspecialchars($_POST['contact']) : ''; ?>" placeholder="09123456789">
                         </div>
                     </div>
 
                     <!-- Stall Selection -->
-                    <div class="form-group full-width">
-                        <label>Select Your Stall (Price is automatic)</label>
-                        <div class="stall-selection">
-                            <!-- Section Tabs -->
+                    <div class="form-group full">
+                        <label>Select Stall</label>
+                        <div class="stall-section">
+                            <?php if (!empty($sections)): ?>
                             <div class="section-tabs" id="sectionTabs">
                                 <?php foreach ($sections as $index => $section): ?>
-                                    <div class="section-tab <?php echo $index === 0 ? 'active' : ''; ?>" 
-                                         data-section="<?php echo $section['name']; ?>"
+                                    <div class="tab <?php echo $index === 0 ? 'active' : ''; ?>" 
                                          onclick="selectSection('<?php echo $section['name']; ?>')">
                                         <i class="fas fa-<?php 
                                             echo $section['icon'] ?? ($section['name'] == 'Meat Section' ? 'drumstick-bite' : 
                                                 ($section['name'] == 'Fish Section' ? 'fish' : 
                                                 ($section['name'] == 'Vegetable Section' ? 'carrot' : 
-                                                ($section['name'] == 'Dry Goods' ? 'box' : 
-                                                ($section['name'] == 'Rice Section' ? 'seedling' : 'store'))))); 
+                                                ($section['name'] == 'Dry Goods' ? 'box' : 'store')))); 
                                         ?>"></i>
                                         <?php echo $section['name']; ?>
                                     </div>
                                 <?php endforeach; ?>
                             </div>
 
-                            <!-- Stall Counter -->
-                            <div class="stall-counter">
-                                <span class="counter-label">
+                            <div class="stall-stats">
+                                <span class="stats-label">
                                     <i class="fas fa-store"></i> Available Stalls
                                 </span>
-                                <span class="counter-badge" id="availableCount">
-                                    <i class="fas fa-check-circle"></i>
-                                    0 available
-                                </span>
+                                <span class="stats-badge" id="availableCount">0 available</span>
                             </div>
 
-                            <!-- Stall Grid -->
                             <div id="stallGrid">
                                 <?php foreach ($sections as $section): ?>
                                     <div class="section-stalls" 
@@ -965,73 +901,62 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                                                 return $stall['section'] === $section['name'];
                                             });
                                             
+                                            if (empty($sectionStalls)) {
+                                                echo '<div style="grid-column:1/-1; text-align:center; padding:30px; color:#94a3b8;">
+                                                        <i class="fas fa-store-slash" style="font-size:30px; margin-bottom:10px;"></i>
+                                                        <p>No stalls available</p>
+                                                      </div>';
+                                            }
+                                            
                                             foreach ($sectionStalls as $stall): 
                                                 $isOccupied = !is_null($stall['tenant_id']);
-                                                $tenantName = $stall['tenant_name'] ?? '';
-                                                $tenantStatus = $stall['tenant_status'] ?? '';
                                                 $stallRent = floatval($stall['monthly_rent']);
                                             ?>
-                                                <div class="stall-item <?php 
-                                                    echo $isOccupied ? 'occupied' : ''; 
-                                                    echo (!$isOccupied && isset($_POST['stall_id']) && $_POST['stall_id'] == $stall['id']) ? ' selected' : '';
-                                                ?>" 
-                                                     onclick="<?php echo !$isOccupied ? "selectStall({$stall['id']}, '{$stall['stall_number']}', '{$stall['section']}', {$stallRent}, this)" : ''; ?>"
-                                                     data-stall-id="<?php echo $stall['id']; ?>"
-                                                     data-monthly-rent="<?php echo $stallRent; ?>">
+                                                <div class="stall-item <?php echo $isOccupied ? 'occupied' : ''; ?>" 
+                                                     onclick="<?php echo !$isOccupied ? "selectStall({$stall['id']}, '{$stall['stall_number']}', '{$stall['section']}', {$stallRent})" : ''; ?>"
+                                                     data-stall-id="<?php echo $stall['id']; ?>">
                                                     
-                                                    <!-- Tooltip -->
-                                                    <?php if ($isOccupied): ?>
-                                                        <div class="stall-tooltip">
-                                                            Occupied by: <?php echo $tenantName; ?> (<?php echo $tenantStatus; ?>)
-                                                        </div>
-                                                    <?php else: ?>
-                                                        <div class="stall-tooltip">
-                                                            ₱<?php echo number_format($stallRent, 2); ?>/month
-                                                        </div>
-                                                    <?php endif; ?>
-                                                    
-                                                    <!-- Stall Icon -->
                                                     <div class="stall-icon">
                                                         <i class="fas fa-<?php 
                                                             echo $section['icon'] ?? ($section['name'] == 'Meat Section' ? 'drumstick-bite' : 
                                                                 ($section['name'] == 'Fish Section' ? 'fish' : 
-                                                                ($section['name'] == 'Vegetable Section' ? 'carrot' : 
-                                                                ($section['name'] == 'Dry Goods' ? 'box' : 
-                                                                ($section['name'] == 'Rice Section' ? 'seedling' : 'store'))))); 
+                                                                ($section['name'] == 'Vegetable Section' ? 'carrot' : 'store'))); 
                                                         ?>"></i>
                                                     </div>
                                                     
-                                                    <!-- Stall Number -->
                                                     <span class="stall-number"><?php echo $stall['stall_number']; ?></span>
-                                                    
-                                                    <!-- Rent Display -->
                                                     <span class="stall-rent">₱<?php echo number_format($stallRent, 0); ?></span>
-                                                    
-                                                    <!-- Status Badge -->
-                                                    <span class="stall-status-badge">
-                                                        <?php if ($isOccupied): ?>
-                                                            <i class="fas fa-lock"></i> Occupied
-                                                        <?php else: ?>
-                                                            <i class="fas fa-check"></i> Available
-                                                        <?php endif; ?>
-                                                    </span>
                                                 </div>
                                             <?php endforeach; ?>
                                         </div>
                                     </div>
                                 <?php endforeach; ?>
                             </div>
+                            <?php else: ?>
+                                <div style="text-align:center; padding:30px;">
+                                    <p style="color:#ef4444;">No stalls available at the moment</p>
+                                </div>
+                            <?php endif; ?>
                         </div>
                     </div>
 
-                    <input type="hidden" name="stall_id" id="selectedStallId" value="<?php echo isset($_POST['stall_id']) ? htmlspecialchars($_POST['stall_id']) : ''; ?>">
+                    <input type="hidden" name="stall_id" id="selectedStallId">
 
-                    <!-- Password Fields -->
+                    <!-- Password -->
                     <div class="form-group">
                         <label>Password</label>
                         <div class="input-wrapper">
                             <i class="fas fa-lock"></i>
-                            <input type="password" name="password" required placeholder="Minimum 6 characters">
+                            <input type="password" name="password" id="password" required placeholder="••••••••">
+                        </div>
+                        <div class="strength-meter">
+                            <div class="strength-bars" id="strengthBars">
+                                <div class="strength-bar"></div>
+                                <div class="strength-bar"></div>
+                                <div class="strength-bar"></div>
+                                <div class="strength-bar"></div>
+                            </div>
+                            <div class="strength-text" id="strengthText"></div>
                         </div>
                     </div>
 
@@ -1039,77 +964,42 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         <label>Confirm Password</label>
                         <div class="input-wrapper">
                             <i class="fas fa-lock"></i>
-                            <input type="password" name="confirm_password" required placeholder="Re-enter password">
+                            <input type="password" name="confirm_password" id="confirmPassword" required placeholder="••••••••">
                         </div>
+                        <div style="font-size:11px; margin-top:4px;" id="matchText"></div>
                     </div>
                 </div>
 
-                <!-- Register Button -->
-                <button type="submit" class="btn-register" id="submitBtn">
+                <button type="submit" class="btn-submit" id="submitBtn">
                     <i class="fas fa-user-plus"></i>
-                    <span>Complete Registration</span>
+                    <span>Create Account</span>
                 </button>
 
-                <!-- Login Link -->
                 <div class="login-link">
-                    <p>Already have an account? <a href="login.php">Sign in here</a></p>
+                    <p>Already have an account?</p>
+                    <a href="login.php">
+                        <i class="fas fa-sign-in-alt"></i> Sign in
+                    </a>
                 </div>
             </form>
-        </div>
-
-        <!-- Footer -->
-        <div class="footer-note">
-            <i class="fas fa-copyright"></i> 2026 MEEDO · Odiongan Public Market · 
-            <a href="#">Terms</a> · <a href="#">Privacy</a>
         </div>
     </div>
 
     <script>
-        let currentSection = '<?php echo $sections[0]['name'] ?? ''; ?>';
-        let selectedStallId = null;
-        let selectedStallRent = 0;
+        let currentSection = '<?php echo !empty($sections) ? $sections[0]['name'] : ''; ?>';
 
-        // Stall data from PHP
-        const allStalls = <?php echo $allStallsJson; ?>;
-
-        // Initialize on load
-        document.addEventListener('DOMContentLoaded', function() {
-            console.log('Sections:', currentSection);
-            console.log('Stalls:', allStalls);
-            
-            if (currentSection) {
-                updateAvailableCount(currentSection);
-            }
-
-            // If there's a pre-selected stall (from form submission), highlight it
-            <?php if (isset($_POST['stall_id']) && isset($_POST['section'])): ?>
-            const selectedId = <?php echo $_POST['stall_id']; ?>;
-            const selectedSection = '<?php echo $_POST['section']; ?>';
-            selectSection(selectedSection);
-            
-            setTimeout(() => {
-                const stallElement = document.querySelector(`.stall-item[data-stall-id="${selectedId}"]`);
-                if (stallElement && !stallElement.classList.contains('occupied')) {
-                    stallElement.classList.add('selected');
-                }
-            }, 100);
-            <?php endif; ?>
-        });
-
-        // Select section
+        // Section switching
         function selectSection(section) {
             currentSection = section;
             
-            // Update tabs
-            document.querySelectorAll('.section-tab').forEach(tab => {
-                if (tab.dataset.section === section) {
+            document.querySelectorAll('.tab').forEach(tab => {
+                if (tab.textContent.includes(section)) {
                     tab.classList.add('active');
                 } else {
                     tab.classList.remove('active');
                 }
             });
             
-            // Update stall grids
             document.querySelectorAll('.section-stalls').forEach(grid => {
                 grid.style.display = 'none';
             });
@@ -1120,37 +1010,30 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 activeGrid.style.display = 'block';
             }
             
-            // Update available count
             updateAvailableCount(section);
         }
 
-        // Select stall - now includes rent
-        function selectStall(stallId, stallNumber, section, monthlyRent, element) {
+        // Stall selection
+        function selectStall(id, number, section, rent) {
             // Remove selected class from all stalls
             document.querySelectorAll('.stall-item').forEach(item => {
                 item.classList.remove('selected');
             });
             
             // Add selected class to clicked stall
-            element.classList.add('selected');
+            const clickedStall = document.querySelector(`[data-stall-id="${id}"]`);
+            if (clickedStall) {
+                clickedStall.classList.add('selected');
+            }
             
             // Update hidden input
-            document.getElementById('selectedStallId').value = stallId;
-            selectedStallId = stallId;
-            selectedStallRent = monthlyRent;
+            document.getElementById('selectedStallId').value = id;
             
             // Show selected stall info
-            const stallInfo = document.getElementById('selectedStallInfo');
-            document.getElementById('selectedStallName').textContent = 'Stall ' + stallNumber;
-            document.getElementById('selectedStallSection').textContent = section;
-            document.getElementById('selectedStallRent').textContent = '₱' + monthlyRent.toLocaleString('en-US', {minimumFractionDigits: 2}) + '/mo';
-            stallInfo.classList.add('show');
-            
-            // Visual feedback
-            element.style.transform = 'scale(0.95)';
-            setTimeout(() => {
-                element.style.transform = '';
-            }, 200);
+            document.getElementById('selectedName').textContent = 'Stall ' + number;
+            document.getElementById('selectedSection').textContent = section;
+            document.getElementById('selectedRent').textContent = '₱' + rent.toLocaleString() + '/mo';
+            document.getElementById('selectedStall').classList.add('show');
         }
 
         // Update available count
@@ -1158,53 +1041,116 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             const grid = document.getElementById('stalls-' + section.replace(/[^a-zA-Z0-9]/g, ''));
             if (grid) {
                 const available = grid.querySelectorAll('.stall-item:not(.occupied)').length;
-                document.getElementById('availableCount').innerHTML = `
-                    <i class="fas fa-check-circle"></i>
-                    ${available} available ${available === 1 ? 'stall' : 'stalls'}
-                `;
+                const badge = document.getElementById('availableCount');
+                if (badge) {
+                    badge.textContent = available + ' available';
+                }
             }
         }
 
-        // Form validation - simplified
-        document.getElementById('registrationForm').addEventListener('submit', function(e) {
-            const form = this;
-            const selectedStall = document.getElementById('selectedStallId').value;
+        // Password strength
+        document.getElementById('password').addEventListener('input', function() {
+            const password = this.value;
+            const strength = calculateStrength(password);
+            const bars = document.querySelectorAll('#strengthBars .strength-bar');
+            const text = document.getElementById('strengthText');
             
-            if (!selectedStall) {
-                e.preventDefault();
-                alert('Please select a stall from the available options');
-                return true;
+            // Reset bars
+            bars.forEach(bar => {
+                bar.className = 'strength-bar';
+            });
+            
+            if (password.length === 0) {
+                text.textContent = '';
+                return;
             }
             
-            // Allow form to submit normally - remove the loading state blocking
-            console.log('Form submitting with stall_id:', selectedStall);
-        });
-
-        // Password strength indicator
-        document.querySelector('input[name="password"]').addEventListener('input', function() {
-            const password = this.value;
-            const strength = calculatePasswordStrength(password);
+            if (password.length < 6) {
+                text.textContent = 'Too short';
+                return;
+            }
             
-            // You can add visual indicator here
+            // Set bars based on strength
+            if (strength <= 2) {
+                bars[0].classList.add('weak');
+                text.textContent = 'Weak';
+            } else if (strength <= 3) {
+                bars[0].classList.add('fair');
+                bars[1].classList.add('fair');
+                text.textContent = 'Fair';
+            } else if (strength <= 4) {
+                bars[0].classList.add('good');
+                bars[1].classList.add('good');
+                bars[2].classList.add('good');
+                text.textContent = 'Good';
+            } else {
+                bars[0].classList.add('strong');
+                bars[1].classList.add('strong');
+                bars[2].classList.add('strong');
+                bars[3].classList.add('strong');
+                text.textContent = 'Strong';
+            }
         });
 
-        function calculatePasswordStrength(password) {
+        function calculateStrength(password) {
             let strength = 0;
             if (password.length >= 8) strength++;
-            if (password.match(/[a-z]+/)) strength++;
-            if (password.match(/[A-Z]+/)) strength++;
-            if (password.match(/[0-9]+/)) strength++;
-            if (password.match(/[$@#&!]+/)) strength++;
+            if (password.match(/[a-z]/)) strength++;
+            if (password.match(/[A-Z]/)) strength++;
+            if (password.match(/[0-9]/)) strength++;
+            if (password.match(/[^a-zA-Z0-9]/)) strength++;
             return strength;
         }
 
-        // Smooth scroll to selected section
-        function scrollToSection(section) {
-            const element = document.getElementById('stalls-' + section.replace(/[^a-zA-Z0-9]/g, ''));
-            if (element) {
-                element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        // Password match
+        document.getElementById('confirmPassword').addEventListener('input', function() {
+            const password = document.getElementById('password').value;
+            const confirm = this.value;
+            const matchText = document.getElementById('matchText');
+            
+            if (confirm.length === 0) {
+                matchText.textContent = '';
+            } else if (password === confirm) {
+                matchText.textContent = '✓ Passwords match';
+                matchText.style.color = '#10b981';
+            } else {
+                matchText.textContent = '✗ Passwords do not match';
+                matchText.style.color = '#ef4444';
             }
-        }
+        });
+
+        // Form submit
+        document.getElementById('registrationForm').addEventListener('submit', function(e) {
+            const stallId = document.getElementById('selectedStallId').value;
+            
+            if (!stallId) {
+                e.preventDefault();
+                alert('Please select a stall');
+                return;
+            }
+            
+            const submitBtn = document.getElementById('submitBtn');
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<span class="loading"></span> Creating Account...';
+        });
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            if (currentSection) {
+                updateAvailableCount(currentSection);
+            }
+            
+            <?php if (isset($_POST['stall_id'])): ?>
+            const stallId = <?php echo $_POST['stall_id']; ?>;
+            const stallElement = document.querySelector(`[data-stall-id="${stallId}"]`);
+            if (stallElement) {
+                const number = stallElement.querySelector('.stall-number').textContent;
+                const section = '<?php echo $_POST['section'] ?? ''; ?>';
+                const rent = stallElement.dataset.monthlyRent || 0;
+                selectStall(stallId, number, section, parseFloat(rent));
+            }
+            <?php endif; ?>
+        });
     </script>
 </body>
 </html>
