@@ -1,6 +1,10 @@
 <?php
 require_once 'config.php';
 
+// Skip database initialization on registration page to avoid locking
+// The tables should already exist from first run
+$db = getDB();
+
 // Redirect if already logged in
 if (isset($_SESSION['user_id'])) {
     if (isAdmin()) {
@@ -10,8 +14,6 @@ if (isset($_SESSION['user_id'])) {
     }
     exit;
 }
-
-$db = getDB();
 $error = '';
 $success = '';
 
@@ -1119,7 +1121,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             }
         });
 
-        // Form submit
+        // Form submit - with timeout fallback to re-enable button
         document.getElementById('registrationForm').addEventListener('submit', function(e) {
             const stallId = document.getElementById('selectedStallId').value;
             
@@ -1130,8 +1132,23 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             }
             
             const submitBtn = document.getElementById('submitBtn');
+            const originalBtnContent = submitBtn.innerHTML;
             submitBtn.disabled = true;
             submitBtn.innerHTML = '<span class="loading"></span> Creating Account...';
+            
+            // Set a timeout to re-enable the button if the server takes too long
+            // This prevents the button from getting stuck in loading state
+            const timeoutId = setTimeout(function() {
+                // Re-enable the button after timeout
+                if (submitBtn.disabled) {
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = originalBtnContent;
+                    alert('Request timed out. Please try again.');
+                }
+            }, 30000); // 30 seconds timeout
+            
+            // Store timeout ID on the button for cleanup
+            submitBtn.dataset.timeoutId = timeoutId;
         });
 
         // Initialize

@@ -11,7 +11,7 @@ function getDB() {
         $db->exec('PRAGMA journal_mode = wal');
         $db->exec('PRAGMA synchronous = NORMAL');
         $db->exec('PRAGMA foreign_keys = ON');
-        $db->exec('PRAGMA busy_timeout = 5000'); // Wait up to 5 seconds when database is busy
+        $db->exec('PRAGMA busy_timeout = 30000'); // Wait up to 30 seconds when database is busy
         
         return $db;
     } catch (PDOException $e) {
