@@ -403,11 +403,27 @@ function initializeDatabase() {
     }
 }
 
-// Call initialization on every page load
-try {
-    initializeDatabase();
-} catch (PDOException $e) {
-    error_log("Database initialization failed: " . $e->getMessage());
-    // Don't die here, just log the error
+// Call initialization on every page load - but only once per request
+// Use a static variable to track if we've already initialized in this request
+static $initialized = false;
+
+if (!$initialized) {
+    try {
+        // Check if basic tables exist before running full initialization
+        $db = getDB();
+        $tableCheck = $db->query("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")->fetch();
+        
+        if ($tableCheck) {
+            // Tables exist - skip expensive initialization
+            // Only run lightweight column migration checks occasionally
+            $initialized = true;
+        } else {
+            initializeDatabase();
+            $initialized = true;
+        }
+    } catch (PDOException $e) {
+        error_log("Database initialization failed: " . $e->getMessage());
+        // Don't die here, just log the error
+    }
 }
 ?>
